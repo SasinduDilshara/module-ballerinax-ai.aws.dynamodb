@@ -22,7 +22,6 @@
 // container are required.
 
 import ballerina/ai;
-import ballerina/cache;
 import ballerina/test;
 import ballerinax/aws.dynamodb;
 
@@ -109,6 +108,106 @@ function testInitAcceptsValidTableName() returns error? {
     _ = check new ShortTermMemoryStore(mocked, tableConfig = {tableName: customTable});
     test:assertTrue(fake.hasTable(customTable),
         string `Store must create the requested custom table '${customTable}'`);
+}
+
+@test:Config {}
+function testInitRejectsNonPositiveMaxMessagesPerKey() returns error? {
+    var [_, mocked] = newFakePair();
+    foreach int invalid in [0, -1, -100] {
+        Error|ShortTermMemoryStore result = new (mocked, invalid);
+        test:assertTrue(result is Error,
+            string `Expected init to fail for maxMessagesPerKey '${invalid}'`);
+        if result is Error {
+            test:assertTrue(result.message().includes("maxMessagesPerKey"),
+                "The error must name the offending parameter");
+        }
+    }
+}
+
+@test:Config {}
+function testInitFromConnectionConfigBuildsItsOwnClient() returns error? {
+    // The `dynamodb:ConnectionConfig` overload constructs the client internally.
+    // Auto-create is switched off so init makes no control-plane call and the test
+    // stays entirely offline — the client is built, never used.
+    ShortTermMemoryStore store = check new ({
+        awsCredentials: {accessKeyId: "test-access-key", secretAccessKey: "test-secret-key"},
+        region: "us-east-1"
+    }, 7, {createTableIfNotExists: false});
+
+    test:assertEquals(store.getCapacity(), 7,
+        "A store built from a connection config must be fully initialized");
+}
+
+@test:Config {}
+function testInitFailsWhenConnectionConfigIsUnusable() returns error? {
+    // A region that cannot form a valid endpoint host makes the underlying
+    // `dynamodb:Client` constructor fail; the store must wrap that rather than
+    // panic or return a half-built store.
+    Error|ShortTermMemoryStore result = new ({
+        awsCredentials: {accessKeyId: "test-access-key", secretAccessKey: "test-secret-key"},
+        region: "not a region"
+    }, tableConfig = {createTableIfNotExists: false});
+
+    test:assertTrue(result is Error, "An unusable connection config must fail init");
+    if result is Error {
+        test:assertTrue(result.message().includes("Failed to create DynamoDB client"),
+            string `Unexpected error message: ${result.message()}`);
+    }
+}
+
+@test:Config {}
+function testInitPassesTagsAndEncryptionToCreateTable() returns error? {
+    var [fake, mocked] = newFakePair();
+    dynamodb:Tag[] tags = [{Key: "env", Value: "test"}, {Key: "owner", Value: "memory-store"}];
+
+    _ = check new ShortTermMemoryStore(mocked, tableConfig = {
+        tags,
+        sseSpecification: {Enabled: true}
+    });
+
+    dynamodb:TableCreateInput? createInput = fake.peekCreateTableInput();
+    if createInput is () {
+        test:assertFail("Expected the store to issue a CreateTable call");
+    }
+    test:assertEquals(createInput.Tags, tags, "Configured tags must reach CreateTable");
+    test:assertEquals(createInput?.SSESpecification?.Enabled, true,
+        "Configured server-side encryption must reach CreateTable");
+}
+
+@test:Config {}
+function testInitOmitsTagsAndEncryptionWhenNotConfigured() returns error? {
+    var [fake, mocked] = newFakePair();
+    // An empty tag array is treated the same as none: DynamoDB rejects an empty
+    // `Tags` list, so the store must leave the field off entirely.
+    _ = check new ShortTermMemoryStore(mocked, tableConfig = {tags: []});
+
+    dynamodb:TableCreateInput? createInput = fake.peekCreateTableInput();
+    if createInput is () {
+        test:assertFail("Expected the store to issue a CreateTable call");
+    }
+    test:assertEquals(createInput.Tags, (), "An empty tag array must not be sent as Tags");
+    test:assertEquals(createInput.SSESpecification, (),
+        "SSESpecification must be omitted when not configured");
+    test:assertEquals(createInput.BillingMode, dynamodb:PAY_PER_REQUEST,
+        "The default billing mode must be on-demand");
+    test:assertEquals(createInput.ProvisionedThroughput, (),
+        "Throughput must be omitted under PAY_PER_REQUEST billing");
+}
+
+@test:Config {}
+function testInitPassesProvisionedThroughputToCreateTable() returns error? {
+    var [fake, mocked] = newFakePair();
+    _ = check new ShortTermMemoryStore(mocked, tableConfig = {
+        billingMode: dynamodb:PROVISIONED, readCapacityUnits: 3, writeCapacityUnits: 2
+    });
+
+    dynamodb:TableCreateInput? createInput = fake.peekCreateTableInput();
+    if createInput is () {
+        test:assertFail("Expected the store to issue a CreateTable call");
+    }
+    test:assertEquals(createInput.BillingMode, dynamodb:PROVISIONED);
+    test:assertEquals(createInput?.ProvisionedThroughput?.ReadCapacityUnits, 3);
+    test:assertEquals(createInput?.ProvisionedThroughput?.WriteCapacityUnits, 2);
 }
 
 @test:Config {}
@@ -606,179 +705,6 @@ function testIsFullIgnoresSystemMessage() returns error? {
 }
 
 // -----------------------------------------------------------------------------
-// Cache behaviour.
-// -----------------------------------------------------------------------------
-
-final cache:CacheConfig CACHE_CONFIG = {capacity: 10, evictionFactor: 0.2};
-
-@test:Config {}
-function testCacheServesAfterFirstLoad() returns error? {
-    var [_, mocked] = newFakePair();
-    ShortTermMemoryStore store = check new (mocked, cacheConfig = CACHE_CONFIG);
-
-    check store.put(K1, SYSTEM_WEATHER);
-    check store.put(K1, USER_INTRO);
-    check store.put(K1, ASSISTANT_GREETING);
-
-    // First read populates the cache; subsequent reads must remain consistent.
-    check assertAllMessages(store, K1, [SYSTEM_WEATHER, USER_INTRO, ASSISTANT_GREETING]);
-    check assertAllMessages(store, K1, [SYSTEM_WEATHER, USER_INTRO, ASSISTANT_GREETING]);
-    check assertInteractiveMessages(store, K1, [USER_INTRO, ASSISTANT_GREETING]);
-}
-
-@test:Config {}
-function testCacheReflectsSubsequentPuts() returns error? {
-    var [_, mocked] = newFakePair();
-    ShortTermMemoryStore store = check new (mocked, cacheConfig = CACHE_CONFIG);
-
-    check store.put(K1, SYSTEM_WEATHER);
-    check store.put(K1, USER_INTRO);
-    check assertAllMessages(store, K1, [SYSTEM_WEATHER, USER_INTRO]);
-
-    check store.put(K1, ASSISTANT_GREETING);
-    check store.put(K1, USER_WEATHER_Q);
-
-    check assertAllMessages(store, K1, [SYSTEM_WEATHER, USER_INTRO, ASSISTANT_GREETING, USER_WEATHER_Q]);
-}
-
-@test:Config {}
-function testCacheReflectsPutAllAfterLoad() returns error? {
-    var [_, mocked] = newFakePair();
-    ShortTermMemoryStore store = check new (mocked, cacheConfig = CACHE_CONFIG);
-
-    check store.put(K1, [SYSTEM_WEATHER, USER_INTRO]);
-    check assertAllMessages(store, K1, [SYSTEM_WEATHER, USER_INTRO]);
-
-    check store.put(K1, [ASSISTANT_GREETING, USER_WEATHER_Q]);
-
-    check assertAllMessages(store, K1, [SYSTEM_WEATHER, USER_INTRO, ASSISTANT_GREETING, USER_WEATHER_Q]);
-}
-
-@test:Config {}
-function testCacheReflectsSystemMessageOverwrite() returns error? {
-    var [_, mocked] = newFakePair();
-    ShortTermMemoryStore store = check new (mocked, cacheConfig = CACHE_CONFIG);
-
-    check store.put(K1, SYSTEM_WEATHER);
-    check store.put(K1, USER_INTRO);
-    check assertAllMessages(store, K1, [SYSTEM_WEATHER, USER_INTRO]);
-
-    check store.put(K1, SYSTEM_SPORTS);
-
-    check assertAllMessages(store, K1, [SYSTEM_SPORTS, USER_INTRO]);
-}
-
-@test:Config {}
-function testCacheReflectsRemoveAll() returns error? {
-    var [_, mocked] = newFakePair();
-    ShortTermMemoryStore store = check new (mocked, cacheConfig = CACHE_CONFIG);
-
-    check store.put(K1, SYSTEM_WEATHER);
-    check store.put(K1, USER_INTRO);
-    check assertAllMessages(store, K1, [SYSTEM_WEATHER, USER_INTRO]);
-
-    check store.removeAll(K1);
-
-    check assertSystemMessage(store, K1, ());
-    check assertInteractiveMessages(store, K1, []);
-}
-
-@test:Config {}
-function testCacheReflectsRemoveSystemMessage() returns error? {
-    var [_, mocked] = newFakePair();
-    ShortTermMemoryStore store = check new (mocked, cacheConfig = CACHE_CONFIG);
-
-    check store.put(K1, SYSTEM_WEATHER);
-    check store.put(K1, USER_INTRO);
-    check assertAllMessages(store, K1, [SYSTEM_WEATHER, USER_INTRO]);
-
-    check store.removeChatSystemMessage(K1);
-
-    check assertSystemMessage(store, K1, ());
-    check assertInteractiveMessages(store, K1, [USER_INTRO]);
-}
-
-@test:Config {}
-function testCacheReflectsRemoveAllInteractive() returns error? {
-    var [_, mocked] = newFakePair();
-    ShortTermMemoryStore store = check new (mocked, cacheConfig = CACHE_CONFIG);
-
-    check store.put(K1, SYSTEM_WEATHER);
-    check store.put(K1, USER_INTRO);
-    check store.put(K1, ASSISTANT_GREETING);
-    check assertAllMessages(store, K1, [SYSTEM_WEATHER, USER_INTRO, ASSISTANT_GREETING]);
-
-    check store.removeChatInteractiveMessages(K1);
-
-    check assertSystemMessage(store, K1, SYSTEM_WEATHER);
-    check assertInteractiveMessages(store, K1, []);
-}
-
-@test:Config {}
-function testCacheReflectsPartialInteractiveRemoval() returns error? {
-    var [_, mocked] = newFakePair();
-    ShortTermMemoryStore store = check new (mocked, cacheConfig = CACHE_CONFIG);
-
-    check store.put(K1, SYSTEM_WEATHER);
-    check store.put(K1, USER_INTRO);
-    check store.put(K1, ASSISTANT_GREETING);
-    check store.put(K1, USER_WEATHER_Q);
-    check store.put(K1, ASSISTANT_WEATHER_A);
-
-    check assertAllMessages(store, K1,
-        [SYSTEM_WEATHER, USER_INTRO, ASSISTANT_GREETING, USER_WEATHER_Q, ASSISTANT_WEATHER_A]);
-
-    check store.removeChatInteractiveMessages(K1, 2);
-
-    check assertInteractiveMessages(store, K1, [USER_WEATHER_Q, ASSISTANT_WEATHER_A]);
-}
-
-@test:Config {}
-function testCacheWithSmallCapacityEvictsLRU() returns error? {
-    var [_, mocked] = newFakePair();
-    cache:CacheConfig tinyCache = {capacity: 2, evictionFactor: 0.5};
-    ShortTermMemoryStore store = check new (mocked, cacheConfig = tinyCache);
-
-    check store.put(K1, USER_INTRO);
-    check store.put(K2, USER_K2);
-    check store.put(K3, USER_WEATHER_Q);
-
-    // Even after eviction, the underlying store still returns the right data.
-    check assertInteractiveMessages(store, K1, [USER_INTRO]);
-    check assertInteractiveMessages(store, K2, [USER_K2]);
-    check assertInteractiveMessages(store, K3, [USER_WEATHER_Q]);
-}
-
-@test:Config {}
-function testCacheNotPopulatedBySystemMessageFetch() returns error? {
-    var [_, mocked] = newFakePair();
-    ShortTermMemoryStore store = check new (mocked, cacheConfig = CACHE_CONFIG);
-
-    check store.put(K1, SYSTEM_WEATHER);
-    check store.put(K1, USER_INTRO);
-
-    // Pulling only the system message must NOT prime the cache; otherwise the
-    // next interactive-message put would either be dropped or duplicated.
-    check assertSystemMessage(store, K1, SYSTEM_WEATHER);
-
-    check store.put(K1, ASSISTANT_GREETING);
-
-    check assertAllMessages(store, K1, [SYSTEM_WEATHER, USER_INTRO, ASSISTANT_GREETING]);
-}
-
-@test:Config {}
-function testIsFullStillUsesDynamoDbWhenCacheEnabled() returns error? {
-    var [_, mocked] = newFakePair();
-    ShortTermMemoryStore store = check new (mocked, 2, CACHE_CONFIG);
-
-    check store.put(K1, USER_INTRO);
-    check store.put(K1, ASSISTANT_GREETING);
-    _ = check store.getAll(K1);
-
-    test:assertTrue(check store.isFull(K1));
-}
-
-// -----------------------------------------------------------------------------
 // Insertion-order sanity (many interactive messages).
 // -----------------------------------------------------------------------------
 
@@ -823,6 +749,76 @@ function testPutAllAppendBatchPreservesOrder() returns error? {
     test:assertEquals(readBack.length(), combined.length());
     foreach int i in 0 ..< combined.length() {
         assertChatMessageEquals(readBack[i], combined[i]);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Chunking at the BatchWriteItem limit.
+//
+// DynamoDB caps BatchWriteItem at 25 requests, so both the append and the delete
+// paths split larger workloads into chunks. These tests cross that boundary
+// several times over to prove nothing is dropped or reordered at the seams.
+// -----------------------------------------------------------------------------
+
+@test:Config {}
+function testPutAllChunksBatchesOverTheWriteLimit() returns error? {
+    var [fake, mocked] = newFakePair();
+    ShortTermMemoryStore store = check new (mocked, 100);
+
+    // 60 messages span three chunks (25 + 25 + 10).
+    ai:ChatMessage[] batch = [];
+    foreach int i in 0 ..< 60 {
+        batch.push({role: ai:USER, content: string `bulk-${i}`});
+    }
+
+    check store.put(K1, batch);
+
+    ai:ChatInteractiveMessage[] readBack = check store.getChatInteractiveMessages(K1);
+    test:assertEquals(readBack.length(), 60, "Every message in a multi-chunk batch must be stored");
+    foreach int i in 0 ..< 60 {
+        assertChatMessageEquals(readBack[i], batch[i]);
+    }
+    test:assertEquals(fake.peekCounter(TABLE_NAME, K1), 60,
+        "The sequence counter must be reserved once for the whole batch");
+}
+
+@test:Config {}
+function testRemoveAllChunksDeletesOverTheWriteLimit() returns error? {
+    var [fake, mocked] = newFakePair();
+    ShortTermMemoryStore store = check new (mocked, 100);
+
+    ai:ChatMessage[] batch = [SYSTEM_WEATHER];
+    foreach int i in 0 ..< 60 {
+        batch.push({role: ai:USER, content: string `bulk-${i}`});
+    }
+    check store.put(K1, batch);
+
+    check store.removeAll(K1);
+
+    test:assertEquals(fake.peekSortIds(TABLE_NAME, K1), [],
+        "A multi-chunk delete must clear every item for the key, counter included");
+    check assertSystemMessage(store, K1, ());
+    check assertInteractiveMessages(store, K1, []);
+}
+
+@test:Config {}
+function testRemoveInteractivePartialAcrossChunkBoundary() returns error? {
+    var [_, mocked] = newFakePair();
+    ShortTermMemoryStore store = check new (mocked, 100);
+
+    ai:ChatMessage[] batch = [];
+    foreach int i in 0 ..< 60 {
+        batch.push({role: ai:USER, content: string `bulk-${i}`});
+    }
+    check store.put(K1, batch);
+
+    // Removing 30 oldest messages spans two delete chunks (25 + 5).
+    check store.removeChatInteractiveMessages(K1, 30);
+
+    ai:ChatInteractiveMessage[] readBack = check store.getChatInteractiveMessages(K1);
+    test:assertEquals(readBack.length(), 30);
+    foreach int i in 0 ..< 30 {
+        assertChatMessageEquals(readBack[i], batch[i + 30]);
     }
 }
 
@@ -937,8 +933,395 @@ function testInitWithCreateTableIfNotExistsFalseUsesExistingTable() returns erro
 }
 
 // -----------------------------------------------------------------------------
+// Control-plane failure propagation.
+//
+// `FakeStorage.setOpFailure` fails a chosen AWS call so the tests can pin down
+// which failures init must abort on and which it must absorb.
+// -----------------------------------------------------------------------------
+
+@test:Config {}
+function testInitFailsWhenDescribeTableErrors() returns error? {
+    var [fake, mocked] = newFakePair();
+    // Anything other than ResourceNotFoundException (here: AccessDenied) means we
+    // cannot tell whether the table exists, so init must abort instead of
+    // attempting a CreateTable that would also fail.
+    fake.setOpFailure(OP_DESCRIBE_TABLE);
+
+    Error|ShortTermMemoryStore result = new (mocked);
+
+    test:assertTrue(result is Error, "A non-ResourceNotFound DescribeTable failure must fail init");
+    if result is Error {
+        test:assertTrue(result.message().includes("Failed to check existence"),
+            string `Unexpected error message: ${result.message()}`);
+    }
+    test:assertFalse(fake.hasTable(TABLE_NAME),
+        "init must not attempt to create the table when DescribeTable is inconclusive");
+}
+
+@test:Config {}
+function testInitToleratesTableCreatedConcurrently() returns error? {
+    var [fake, mocked] = newFakePair();
+    _ = check new ShortTermMemoryStore(mocked);
+
+    // Model the init race: our DescribeTable reports the table absent, but by the
+    // time we call CreateTable another initializer has already made it, so AWS
+    // answers ResourceInUseException. The store must treat that as success and
+    // simply wait for the table to go ACTIVE.
+    fake.setPhantomAbsentDescribes(1);
+
+    ShortTermMemoryStore store = check new (mocked);
+
+    check store.put(K1, USER_INTRO);
+    check assertInteractiveMessages(store, K1, [USER_INTRO]);
+}
+
+@test:Config {}
+function testInitFailsWhenCreateTableErrors() returns error? {
+    var [fake, mocked] = newFakePair();
+    // A CreateTable failure that is *not* ResourceInUseException (here:
+    // LimitExceeded) is fatal — there is no table to fall back on.
+    fake.setOpFailure(OP_CREATE_TABLE);
+
+    Error|ShortTermMemoryStore result = new (mocked);
+
+    test:assertTrue(result is Error, "A fatal CreateTable failure must fail init");
+    if result is Error {
+        test:assertTrue(result.message().includes("Failed to create"),
+            string `Unexpected error message: ${result.message()}`);
+    }
+}
+
+// Disabled by design: the store polls `MAX_TABLE_ACTIVATION_RETRIES` (300) times
+// at `TABLE_ACTIVATION_RETRY_INTERVAL` (2s), so driving it to the give-up branch
+// takes ~10 minutes of wall clock — too slow for the default suite. Enable it
+// when touching the activation-wait loop or either constant.
+@test:Config {enable: false}
+function testInitFailsWhenTableNeverBecomesActive() returns error? {
+    var [fake, mocked] = newFakePair();
+    _ = check new ShortTermMemoryStore(mocked);
+
+    // Report CREATING for more polls than the store is willing to make.
+    fake.setActivationPolls(MAX_TABLE_ACTIVATION_RETRIES + 1);
+
+    Error|ShortTermMemoryStore result = new (mocked);
+
+    test:assertTrue(result is Error, "init must give up once the activation budget is exhausted");
+    if result is Error {
+        test:assertTrue(result.message().includes("did not become active"),
+            string `Unexpected error message: ${result.message()}`);
+    }
+}
+
+@test:Config {}
+function testInitFailsWhenActivationPollErrors() returns error? {
+    var [fake, mocked] = newFakePair();
+    _ = check new ShortTermMemoryStore(mocked);
+
+    // Let the existence check through, then fail the DescribeTable that
+    // `waitForTableActive` issues. The status is unknown, so init must abort.
+    fake.setOpFailure(OP_DESCRIBE_TABLE, count = 1, skip = 1);
+
+    Error|ShortTermMemoryStore result = new (mocked);
+
+    test:assertTrue(result is Error, "A DescribeTable failure while polling must fail init");
+    if result is Error {
+        test:assertTrue(result.message().includes("Failed to check the status"),
+            string `Unexpected error message: ${result.message()}`);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Data-plane failure propagation.
+//
+// Every store operation wraps its DynamoDB failures in an `Error`. These tests
+// fail one AWS call at a time and assert the operation surfaces it instead of
+// returning a partial or empty result.
+// -----------------------------------------------------------------------------
+
+@test:Config {}
+function testGetSystemMessageFailsWhenGetItemErrors() returns error? {
+    var [fake, mocked] = newFakePair();
+    ShortTermMemoryStore store = check new (mocked);
+    check store.put(K1, SYSTEM_WEATHER);
+
+    fake.setOpFailure(OP_GET_ITEM);
+    ai:ChatSystemMessage|Error? result = store.getChatSystemMessage(K1);
+
+    test:assertTrue(result is Error,
+        "A GetItem failure must surface as an error, not as an absent system message");
+}
+
+@test:Config {}
+function testGetInteractiveMessagesFailsWhenQueryErrors() returns error? {
+    var [fake, mocked] = newFakePair();
+    ShortTermMemoryStore store = check new (mocked);
+    check store.put(K1, USER_INTRO);
+
+    fake.setOpFailure(OP_QUERY);
+    ai:ChatInteractiveMessage[]|Error result = store.getChatInteractiveMessages(K1);
+
+    test:assertTrue(result is Error,
+        "A Query failure must surface as an error, not as an empty message list");
+}
+
+@test:Config {}
+function testGetAllFailsWhenQueryErrors() returns error? {
+    var [fake, mocked] = newFakePair();
+    ShortTermMemoryStore store = check new (mocked);
+    check store.put(K1, [SYSTEM_WEATHER, USER_INTRO]);
+
+    fake.setOpFailure(OP_QUERY);
+    var result = store.getAll(K1);
+
+    test:assertTrue(result is Error,
+        "A Query failure must surface as an error, not as an empty message list");
+}
+
+@test:Config {}
+function testIsFullFailsWhenQueryErrors() returns error? {
+    var [fake, mocked] = newFakePair();
+    ShortTermMemoryStore store = check new (mocked, 2);
+    check store.put(K1, USER_INTRO);
+
+    fake.setOpFailure(OP_QUERY);
+    boolean|Error result = store.isFull(K1);
+
+    test:assertTrue(result is Error,
+        "isFull must not report `false` when the count query failed");
+}
+
+@test:Config {}
+function testPutSystemMessageFailsWhenPutItemErrors() returns error? {
+    var [fake, mocked] = newFakePair();
+    ShortTermMemoryStore store = check new (mocked);
+
+    fake.setOpFailure(OP_CREATE_ITEM);
+    Error? result = store.put(K1, SYSTEM_WEATHER);
+
+    test:assertTrue(result is Error, "A failed system-message PutItem must be reported");
+    test:assertEquals(fake.peekBody(TABLE_NAME, K1, SYSTEM_MESSAGE_ID), (),
+        "Nothing must be persisted when the write failed");
+}
+
+@test:Config {}
+function testPutInteractiveMessageFailsWhenPutItemErrors() returns error? {
+    var [fake, mocked] = newFakePair();
+    ShortTermMemoryStore store = check new (mocked);
+
+    fake.setOpFailure(OP_CREATE_ITEM);
+    Error? result = store.put(K1, USER_INTRO);
+
+    test:assertTrue(result is Error, "A failed interactive-message PutItem must be reported");
+}
+
+@test:Config {}
+function testPutFailsWhenSequenceCounterUpdateErrors() returns error? {
+    var [fake, mocked] = newFakePair();
+    ShortTermMemoryStore store = check new (mocked);
+
+    // Without a sequence number there is no sort key to write under, so the
+    // append must abort before touching any item.
+    fake.setOpFailure(OP_UPDATE_ITEM);
+    Error? result = store.put(K1, USER_INTRO);
+
+    test:assertTrue(result is Error, "A failed counter UpdateItem must be reported");
+    test:assertEquals(fake.peekSortIds(TABLE_NAME, K1), [],
+        "No message item must be written when the sequence could not be reserved");
+}
+
+@test:Config {}
+function testPutFailsWhenSequenceCounterResponseHasNoAttributes() returns error? {
+    var [fake, mocked] = newFakePair();
+    ShortTermMemoryStore store = check new (mocked);
+
+    // A counter update that comes back without `Attributes` must not be read as
+    // sequence 0 — that would silently overwrite the first stored message.
+    fake.setCounterResponseMode(COUNTER_RESPONSE_NO_ATTRIBUTES);
+    Error? result = store.put(K1, USER_INTRO);
+
+    test:assertTrue(result is Error, "A counter response without Attributes must be rejected");
+}
+
+@test:Config {}
+function testPutFailsWhenSequenceCounterResponseIsNonNumeric() returns error? {
+    var [fake, mocked] = newFakePair();
+    ShortTermMemoryStore store = check new (mocked);
+
+    fake.setCounterResponseMode(COUNTER_RESPONSE_NON_NUMERIC);
+    Error? result = store.put(K1, USER_INTRO);
+
+    test:assertTrue(result is Error, "An unparseable counter value must be rejected");
+}
+
+@test:Config {}
+function testPutAllFailsWhenBatchWriteErrors() returns error? {
+    var [fake, mocked] = newFakePair();
+    ShortTermMemoryStore store = check new (mocked);
+
+    // An outright BatchWriteItem error (as opposed to unprocessed items, which
+    // are retried) is not retryable and must be surfaced immediately.
+    fake.setOpFailure(OP_WRITE_BATCH_ITEMS);
+    Error? result = store.put(K1, [USER_INTRO, ASSISTANT_GREETING]);
+
+    test:assertTrue(result is Error, "A failed BatchWriteItem must be reported");
+}
+
+@test:Config {}
+function testRemoveSystemMessageFailsWhenDeleteItemErrors() returns error? {
+    var [fake, mocked] = newFakePair();
+    ShortTermMemoryStore store = check new (mocked);
+    check store.put(K1, SYSTEM_WEATHER);
+
+    fake.setOpFailure(OP_DELETE_ITEM);
+    Error? result = store.removeChatSystemMessage(K1);
+
+    test:assertTrue(result is Error, "A failed DeleteItem must be reported");
+    // The message is still there, so a caller that retries can still delete it.
+    check assertSystemMessage(store, K1, SYSTEM_WEATHER);
+}
+
+@test:Config {}
+function testRemoveInteractiveMessagesFailsWhenQueryErrors() returns error? {
+    var [fake, mocked] = newFakePair();
+    ShortTermMemoryStore store = check new (mocked);
+    check store.put(K1, USER_INTRO);
+
+    // The sort keys to delete come from a Query; if that fails there is nothing
+    // to delete and the caller must hear about it.
+    fake.setOpFailure(OP_QUERY);
+    Error? result = store.removeChatInteractiveMessages(K1);
+
+    test:assertTrue(result is Error, "A failed sort-key Query must be reported");
+    check assertInteractiveMessages(store, K1, [USER_INTRO]);
+}
+
+@test:Config {}
+function testRemoveInteractiveMessagesFailsWhenBatchWriteErrors() returns error? {
+    var [fake, mocked] = newFakePair();
+    ShortTermMemoryStore store = check new (mocked);
+    check store.put(K1, [USER_INTRO, ASSISTANT_GREETING]);
+
+    // Let the sort-key Query through and fail the batch delete instead.
+    fake.setOpFailure(OP_WRITE_BATCH_ITEMS);
+    Error? result = store.removeChatInteractiveMessages(K1, 1);
+
+    test:assertTrue(result is Error, "A failed batch delete must be reported");
+    check assertInteractiveMessages(store, K1, [USER_INTRO, ASSISTANT_GREETING]);
+}
+
+@test:Config {}
+function testRemoveAllFailsWhenBatchWriteErrors() returns error? {
+    var [fake, mocked] = newFakePair();
+    ShortTermMemoryStore store = check new (mocked);
+    check store.put(K1, [SYSTEM_WEATHER, USER_INTRO]);
+
+    fake.setOpFailure(OP_WRITE_BATCH_ITEMS);
+    Error? result = store.removeAll(K1);
+
+    test:assertTrue(result is Error, "A failed batch delete must be reported");
+    check assertAllMessages(store, K1, [SYSTEM_WEATHER, USER_INTRO]);
+}
+
+@test:Config {}
+function testRemoveAllFailsWhenQueryErrors() returns error? {
+    var [fake, mocked] = newFakePair();
+    ShortTermMemoryStore store = check new (mocked);
+    check store.put(K1, USER_INTRO);
+
+    fake.setOpFailure(OP_QUERY);
+    Error? result = store.removeAll(K1);
+
+    test:assertTrue(result is Error, "A failed sort-key Query must be reported");
+}
+
+// -----------------------------------------------------------------------------
+// Malformed and unexpected stored data.
+//
+// The store owns the encoding of every item body, but a body can still be
+// corrupted out of band (a manual console edit, a partial migration, another
+// writer). Reads must fail loudly rather than hand back a half-decoded message.
+// -----------------------------------------------------------------------------
+
+@test:Config {}
+function testGetSystemMessageFailsOnMalformedStoredBody() returns error? {
+    var [fake, mocked] = newFakePair();
+    ShortTermMemoryStore store = check new (mocked);
+    check store.put(K1, SYSTEM_WEATHER);
+
+    fake.putItem(TABLE_NAME, K1, SYSTEM_MESSAGE_ID, "{\"role\":");
+    ai:ChatSystemMessage|Error? result = store.getChatSystemMessage(K1);
+
+    test:assertTrue(result is Error, "A corrupt system-message body must fail the read");
+}
+
+@test:Config {}
+function testGetAllFailsOnMalformedSystemBody() returns error? {
+    var [fake, mocked] = newFakePair();
+    ShortTermMemoryStore store = check new (mocked);
+    check store.put(K1, [SYSTEM_WEATHER, USER_INTRO]);
+
+    // Valid JSON, but not a system message: the role is missing.
+    fake.putItem(TABLE_NAME, K1, SYSTEM_MESSAGE_ID, "{\"content\":\"orphaned\"}");
+    var result = store.getAll(K1);
+
+    test:assertTrue(result is Error, "A corrupt system-message body must fail getAll");
+}
+
+@test:Config {}
+function testGetAllFailsOnMalformedInteractiveBody() returns error? {
+    var [fake, mocked] = newFakePair();
+    ShortTermMemoryStore store = check new (mocked);
+    check store.put(K1, USER_INTRO);
+
+    string interactiveSortId = check firstInteractiveSortId(fake, TABLE_NAME, K1);
+    fake.putItem(TABLE_NAME, K1, interactiveSortId, "not json at all");
+    var result = store.getAll(K1);
+
+    test:assertTrue(result is Error, "A corrupt interactive-message body must fail getAll");
+}
+
+@test:Config {}
+function testGetInteractiveMessagesFailsOnMalformedInteractiveBody() returns error? {
+    var [fake, mocked] = newFakePair();
+    ShortTermMemoryStore store = check new (mocked);
+    check store.put(K1, USER_INTRO);
+
+    string interactiveSortId = check firstInteractiveSortId(fake, TABLE_NAME, K1);
+    // Valid JSON of the wrong shape — an unknown role the store cannot map.
+    fake.putItem(TABLE_NAME, K1, interactiveSortId, "{\"role\":\"alien\",\"content\":\"hi\"}");
+    ai:ChatInteractiveMessage[]|Error result = store.getChatInteractiveMessages(K1);
+
+    test:assertTrue(result is Error, "A corrupt interactive-message body must fail the read");
+}
+
+@test:Config {}
+function testGetAllSkipsQueryRowsWithoutAnItem() returns error? {
+    var [fake, mocked] = newFakePair();
+    ShortTermMemoryStore store = check new (mocked);
+    check store.put(K1, [SYSTEM_WEATHER, USER_INTRO, ASSISTANT_GREETING]);
+
+    // A Query page that carries no `Item` (which the connector's stream can
+    // yield) must be skipped rather than counted as a message.
+    fake.setEmitItemlessQueryRow(true);
+
+    check assertAllMessages(store, K1, [SYSTEM_WEATHER, USER_INTRO, ASSISTANT_GREETING]);
+    check assertInteractiveMessages(store, K1, [USER_INTRO, ASSISTANT_GREETING]);
+}
+
+// -----------------------------------------------------------------------------
 // Shared assertions.
 // -----------------------------------------------------------------------------
+
+// Returns the sort key of the first interactive item stored under `key`, so a
+// test can corrupt a message body without hard-coding the padded sequence.
+function firstInteractiveSortId(FakeStorage fake, string tableName, string key) returns string|error {
+    foreach string sortId in fake.peekSortIds(tableName, key) {
+        if sortId.startsWith(INTERACTIVE_ID_PREFIX) {
+            return sortId;
+        }
+    }
+    return error(string `No interactive item found under '${key}'`);
+}
 
 function assertAllMessages(ShortTermMemoryStore store, string key, ai:ChatMessage[] expected) returns error? {
     ai:ChatMessage[] actual = check store.getAll(key);

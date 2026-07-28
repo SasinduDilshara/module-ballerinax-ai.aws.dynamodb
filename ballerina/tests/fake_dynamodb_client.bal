@@ -26,6 +26,26 @@ import ballerinax/aws.dynamodb;
 
 const string COMPOSITE_KEY_DELIM = "\u{1}";
 
+// Operation names accepted by `FakeStorage.setOpFailure`. They mirror the
+// `dynamodb:Client` remote methods the store calls, so a test can fail any
+// single AWS call and assert how the store surfaces it.
+const string OP_DESCRIBE_TABLE = "describeTable";
+const string OP_CREATE_TABLE = "createTable";
+const string OP_GET_ITEM = "getItem";
+const string OP_CREATE_ITEM = "createItem";
+const string OP_UPDATE_ITEM = "updateItem";
+const string OP_DELETE_ITEM = "deleteItem";
+const string OP_QUERY = "query";
+const string OP_WRITE_BATCH_ITEMS = "writeBatchItems";
+
+// Shapes the `updateItem` response can take, selected via
+// `FakeStorage.setCounterResponseMode`. `COUNTER_RESPONSE_NORMAL` returns the
+// new sequence under `Attributes` the way DynamoDB does; the other two model
+// malformed responses the store has to defend against.
+const string COUNTER_RESPONSE_NORMAL = "normal";
+const string COUNTER_RESPONSE_NO_ATTRIBUTES = "noAttributes";
+const string COUNTER_RESPONSE_NON_NUMERIC = "nonNumeric";
+
 isolated class FakeStorage {
     private map<()> tables = {};
     // Composite key (`tableName + DELIM + partition + DELIM + sort`) -> body string.
@@ -34,8 +54,8 @@ isolated class FakeStorage {
     private map<int> counters = {};
 
     // ----- Fault-injection knobs (configured by tests before exercising the
-    // store). Both default to 0, so unless a test opts in the fake behaves like
-    // an always-healthy DynamoDB and existing tests are unaffected. -----
+    // store). Every one of them defaults to "no fault", so unless a test opts in
+    // the fake behaves like an always-healthy DynamoDB. -----
 
     // While > 0, the next `writeBatchItems` call persists nothing and reports
     // every request back as `UnprocessedItems`, then decrements. This drives the
@@ -45,8 +65,101 @@ isolated class FakeStorage {
     // `CREATING` instead of `ACTIVE`, then decrements. This drives the store's
     // `waitForTableActive` polling loop after a table is created.
     private int activationPollsRemaining = 0;
+    // Per-operation forced failures: `opFailures[op]` counts how many upcoming
+    // calls to that operation must error, and `opSkips[op]` how many to let
+    // through first (so a test can fail, say, only the second `describeTable`).
+    private map<int> opFailures = {};
+    private map<int> opSkips = {};
+    // While > 0, `describeTable` reports the table as absent even though it
+    // exists, then decrements. This makes the store take its create-table branch
+    // against a table that is already there, which is what a race between two
+    // concurrent initializers looks like from one initializer's point of view.
+    private int phantomAbsentDescribesRemaining = 0;
+    // The shape `updateItem` uses for its response. See the
+    // `COUNTER_RESPONSE_*` constants.
+    private string counterResponseMode = COUNTER_RESPONSE_NORMAL;
+    // While true, every `query` result stream is prefixed with one output that
+    // carries no `Item`, which the store must skip rather than misread.
+    private boolean emitItemlessQueryRow = false;
+    // The most recent `CreateTable` payload, kept so tests can assert what the
+    // store actually asked AWS for (billing mode, throughput, tags, encryption).
+    private (dynamodb:TableCreateInput & readonly)? lastCreateTableInput = ();
 
     isolated function init() {
+    }
+
+    // Arms the next `count` calls to `operation` (after letting `skip` calls
+    // through) to fail with an injected error.
+    isolated function setOpFailure(string operation, int count = 1, int skip = 0) {
+        lock {
+            self.opFailures[operation] = count;
+            self.opSkips[operation] = skip;
+        }
+    }
+
+    // Returns true (consuming one armed failure) if this call must error.
+    isolated function consumeOpFailure(string operation) returns boolean {
+        lock {
+            int remaining = self.opFailures[operation] ?: 0;
+            if remaining <= 0 {
+                return false;
+            }
+            int skips = self.opSkips[operation] ?: 0;
+            if skips > 0 {
+                self.opSkips[operation] = skips - 1;
+                return false;
+            }
+            self.opFailures[operation] = remaining - 1;
+            return true;
+        }
+    }
+
+    // Arms `count` consecutive `describeTable` calls to report the table absent
+    // regardless of whether it exists.
+    isolated function setPhantomAbsentDescribes(int count) {
+        lock {
+            self.phantomAbsentDescribesRemaining = count;
+        }
+    }
+
+    isolated function consumePhantomAbsentDescribe() returns boolean {
+        lock {
+            if self.phantomAbsentDescribesRemaining <= 0 {
+                return false;
+            }
+            self.phantomAbsentDescribesRemaining -= 1;
+            return true;
+        }
+    }
+
+    isolated function setCounterResponseMode(string mode) {
+        lock {
+            self.counterResponseMode = mode;
+        }
+    }
+
+    isolated function getCounterResponseMode() returns string {
+        lock {
+            return self.counterResponseMode;
+        }
+    }
+
+    isolated function setEmitItemlessQueryRow(boolean emit) {
+        lock {
+            self.emitItemlessQueryRow = emit;
+        }
+    }
+
+    isolated function shouldEmitItemlessQueryRow() returns boolean {
+        lock {
+            return self.emitItemlessQueryRow;
+        }
+    }
+
+    isolated function recordCreateTableInput(dynamodb:TableCreateInput input) {
+        lock {
+            self.lastCreateTableInput = input.cloneReadOnly();
+        }
     }
 
     // Arms `rounds` consecutive `writeBatchItems` calls to report all of their
@@ -200,6 +313,12 @@ isolated class FakeStorage {
             return self.tables.hasKey(tableName);
         }
     }
+
+    isolated function peekCreateTableInput() returns (dynamodb:TableCreateInput & readonly)? {
+        lock {
+            return self.lastCreateTableInput;
+        }
+    }
 }
 
 // The single "current" FakeStorage instance that every `FakeDynamoDbClient`
@@ -255,7 +374,12 @@ isolated client class FakeDynamoDbClient {
 
     remote isolated function describeTable(string tableName) returns dynamodb:TableDescription|error {
         FakeStorage storage = getActiveStorage();
-        if !storage.tableExists(tableName) {
+        if storage.consumeOpFailure(OP_DESCRIBE_TABLE) {
+            // Deliberately *not* a ResourceNotFoundException: the store must treat
+            // any other DescribeTable failure as fatal instead of trying to create.
+            return error(string `AccessDeniedException: not authorized to DescribeTable '${tableName}'`);
+        }
+        if !storage.tableExists(tableName) || storage.consumePhantomAbsentDescribe() {
             return error(string `ResourceNotFoundException: table '${tableName}' not found`);
         }
         // When a test has armed activation polls, report the table as still
@@ -269,6 +393,10 @@ isolated client class FakeDynamoDbClient {
     remote isolated function createTable(dynamodb:TableCreateInput input)
             returns dynamodb:TableDescription|error {
         FakeStorage storage = getActiveStorage();
+        storage.recordCreateTableInput(input);
+        if storage.consumeOpFailure(OP_CREATE_TABLE) {
+            return error(string `LimitExceededException: cannot create table '${input.TableName}'`);
+        }
         if !storage.createTableIfAbsent(input.TableName) {
             return error(string `ResourceInUseException: table '${input.TableName}' already exists`);
         }
@@ -278,6 +406,9 @@ isolated client class FakeDynamoDbClient {
     remote isolated function getItem(dynamodb:ItemGetInput input)
             returns dynamodb:ItemGetOutput|error {
         FakeStorage storage = getActiveStorage();
+        if storage.consumeOpFailure(OP_GET_ITEM) {
+            return error("ProvisionedThroughputExceededException: GetItem throttled");
+        }
         if !storage.tableExists(input.TableName) {
             return error(string `ResourceNotFoundException: table '${input.TableName}'`);
         }
@@ -297,6 +428,9 @@ isolated client class FakeDynamoDbClient {
     remote isolated function createItem(dynamodb:ItemCreateInput input)
             returns dynamodb:ItemDescription|error {
         FakeStorage storage = getActiveStorage();
+        if storage.consumeOpFailure(OP_CREATE_ITEM) {
+            return error("ProvisionedThroughputExceededException: PutItem throttled");
+        }
         if !storage.tableExists(input.TableName) {
             return error(string `ResourceNotFoundException: table '${input.TableName}'`);
         }
@@ -313,6 +447,9 @@ isolated client class FakeDynamoDbClient {
     remote isolated function updateItem(dynamodb:ItemUpdateInput input)
             returns dynamodb:ItemDescription|error {
         FakeStorage storage = getActiveStorage();
+        if storage.consumeOpFailure(OP_UPDATE_ITEM) {
+            return error("ProvisionedThroughputExceededException: UpdateItem throttled");
+        }
         if !storage.tableExists(input.TableName) {
             return error(string `ResourceNotFoundException: table '${input.TableName}'`);
         }
@@ -336,12 +473,25 @@ isolated client class FakeDynamoDbClient {
         }
 
         int newSeq = storage.incrementCounter(input.TableName, pk, sk, delta);
+        match storage.getCounterResponseMode() {
+            COUNTER_RESPONSE_NO_ATTRIBUTES => {
+                // DynamoDB omitting `Attributes` (e.g. an unexpected ReturnValues
+                // handling change) must not be mistaken for sequence zero.
+                return {};
+            }
+            COUNTER_RESPONSE_NON_NUMERIC => {
+                return {Attributes: {[SEQUENCE_ATTRIBUTE]: {N: "not-a-number"}}};
+            }
+        }
         return {Attributes: {[SEQUENCE_ATTRIBUTE]: {N: newSeq.toString()}}};
     }
 
     remote isolated function deleteItem(dynamodb:ItemDeleteInput input)
             returns dynamodb:ItemDescription|error {
         FakeStorage storage = getActiveStorage();
+        if storage.consumeOpFailure(OP_DELETE_ITEM) {
+            return error("ProvisionedThroughputExceededException: DeleteItem throttled");
+        }
         if !storage.tableExists(input.TableName) {
             return error(string `ResourceNotFoundException: table '${input.TableName}'`);
         }
@@ -353,6 +503,9 @@ isolated client class FakeDynamoDbClient {
     remote isolated function query(dynamodb:QueryInput input)
             returns stream<dynamodb:QueryOutput, error?>|error {
         FakeStorage storage = getActiveStorage();
+        if storage.consumeOpFailure(OP_QUERY) {
+            return error("ProvisionedThroughputExceededException: Query throttled");
+        }
         if !storage.tableExists(input.TableName) {
             return error(string `ResourceNotFoundException: table '${input.TableName}'`);
         }
@@ -385,6 +538,9 @@ isolated client class FakeDynamoDbClient {
         }
 
         dynamodb:QueryOutput[] outputs = [];
+        if storage.shouldEmitItemlessQueryRow() {
+            outputs.push({});
+        }
         foreach string sortId in sortIds {
             map<dynamodb:AttributeValue> item;
             if projection == "#sk" {
@@ -406,6 +562,9 @@ isolated client class FakeDynamoDbClient {
     remote isolated function writeBatchItems(dynamodb:BatchItemInsertInput input)
             returns dynamodb:BatchItemInsertOutput|error {
         FakeStorage storage = getActiveStorage();
+        if storage.consumeOpFailure(OP_WRITE_BATCH_ITEMS) {
+            return error("ProvisionedThroughputExceededException: BatchWriteItem throttled");
+        }
         // Fault injection: while a test has armed unprocessed rounds, persist
         // nothing and echo every request straight back as `UnprocessedItems`, so
         // the store must retry the same chunk. Real DynamoDB does this under

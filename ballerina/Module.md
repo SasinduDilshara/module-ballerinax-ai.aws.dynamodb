@@ -8,7 +8,6 @@ This Ballerina module provides an Amazon DynamoDB-backed short-term memory store
 
 - **DynamoDB-backed storage**: Persistent storage of chat messages, one item per message, in a single DynamoDB table with a composite primary key
 - **Configurable message limits**: Set the maximum number of interactive messages per session key (default: 20)
-- **In-memory caching**: Optional cache layer for improved read performance; disabled by default and only activated when the `cacheConfig` parameter is provided to the store initializer
 - **Automatic table creation**: The table is created on initialization if it does not already exist, with a configurable billing mode
 - **Flexible initialization**: Use either a connection configuration or a pre-created `dynamodb:Client`
 
@@ -53,17 +52,6 @@ dynamodb:ShortTermMemoryStore store = check new ({
     awsCredentials: {accessKeyId: "...", secretAccessKey: "..."},
     region: "us-east-1"
 }, maxMessagesPerKey = 50);
-```
-
-### Cache Configuration
-
-```ballerina
-import ballerina/cache;
-
-dynamodb:ShortTermMemoryStore store = check new ({
-    awsCredentials: {accessKeyId: "...", secretAccessKey: "..."},
-    region: "us-east-1"
-}, cacheConfig = {capacity: 30, evictionFactor: 0.2});
 ```
 
 ### Table Name and Billing Mode

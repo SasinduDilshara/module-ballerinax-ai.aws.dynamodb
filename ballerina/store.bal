@@ -15,7 +15,6 @@
 // under the License.
 
 import ballerina/ai;
-import ballerina/cache;
 import ballerina/lang.regexp;
 import ballerina/lang.runtime;
 import ballerina/random;
@@ -43,8 +42,7 @@ public type Error distinct ai:MemoryError;
 # + writeCapacityUnits - The write capacity units to provision when `billingMode` is `dynamodb:PROVISIONED`
 # + consistentReads - Whether reads against DynamoDB use strongly consistent reads. Defaults to `false`
 # (eventually consistent), matching the DynamoDB default. Strongly consistent reads cost twice the read
-# capacity units of eventually consistent reads, and the in-memory cache absorbs the brief staleness
-# window in the common single-actor case; set to `true` only when strong consistency is required
+# capacity units of eventually consistent reads; set to `true` only when strong consistency is required
 # + tags - Optional tags to apply to the DynamoDB table when the connector creates it. Ignored if the
 # table already exists
 # + sseSpecification - Optional server-side encryption settings to apply when the connector creates
@@ -96,18 +94,12 @@ const decimal BATCH_WRITE_MAX_DELAY = 20.0;
 const int MAX_TABLE_ACTIVATION_RETRIES = 300;
 const decimal TABLE_ACTIVATION_RETRY_INTERVAL = 2;
 
-type CachedMessages record {|
-    readonly & ai:ChatSystemMessage systemMessage?;
-    (readonly & ai:ChatInteractiveMessage)[] interactiveMessages;
-|};
-
 # Represents a DynamoDB-backed short-term memory store for messages.
 @display {label: "DynamoDB Short Term Memory Store"}
 public isolated class ShortTermMemoryStore {
     *ai:ShortTermMemoryStore;
 
     private final dynamodb:Client dynamodbClient;
-    private final cache:Cache? cache;
     private final int maxMessagesPerKey;
     private final string tableName;
     private final boolean consistentReads;
@@ -116,14 +108,12 @@ public isolated class ShortTermMemoryStore {
     #
     # + dynamodbClient - The DynamoDB client or connection configuration to connect to DynamoDB
     # + maxMessagesPerKey - The maximum number of interactive messages to store per key
-    # + cacheConfig - The cache configuration for in-memory caching of messages
     # + tableConfig - Configuration for the DynamoDB table that backs the store, including the table
     # name, whether to auto-create the table, billing mode, provisioned throughput, read consistency,
     # tags, and server-side encryption
     # + returns - An error if the initialization fails
     public isolated function init(dynamodb:Client|dynamodb:ConnectionConfig dynamodbClient,
             int maxMessagesPerKey = 20,
-            cache:CacheConfig? cacheConfig = (),
             TableConfig tableConfig = {}) returns Error? {
         if !isValidTableName(tableConfig.tableName) {
             return error(string `Invalid table name: '${tableConfig.tableName}'.`
@@ -152,7 +142,6 @@ public isolated class ShortTermMemoryStore {
             self.dynamodbClient = initializedClient;
         }
         self.maxMessagesPerKey = maxMessagesPerKey;
-        self.cache = cacheConfig is () ? () : new (cacheConfig);
         self.consistentReads = tableConfig.consistentReads;
         if tableConfig.createTableIfNotExists {
             check self.initializeTable(tableConfig);
@@ -165,13 +154,6 @@ public isolated class ShortTermMemoryStore {
     # + return - A copy of the message if it was specified, nil if it was not, or an
     # `Error` error if the operation fails
     public isolated function getChatSystemMessage(string key) returns ai:ChatSystemMessage|Error? {
-        lock {
-            CachedMessages? cacheEntry = self.getCacheEntry(key);
-            if cacheEntry is CachedMessages {
-                return cacheEntry.systemMessage;
-            }
-        }
-
         string|Error? systemMessageJson = self.getMessageBody(key, SYSTEM_MESSAGE_ID);
 
         if systemMessageJson is () {
@@ -187,8 +169,6 @@ public isolated class ShortTermMemoryStore {
             return error("Failed to parse chat message from DynamoDB: " + dbMessage.message(), dbMessage);
         }
 
-        // We intentionally don't populate the cache when just the system message is fetched
-        // to avoid having to load interactive messages as well.
         return transformFromSystemMessageDatabaseMessage(dbMessage);
     }
 
@@ -198,15 +178,8 @@ public isolated class ShortTermMemoryStore {
     # + key - The key associated with the memory
     # + return - A copy of the messages, or an `Error` error if the operation fails
     public isolated function getChatInteractiveMessages(string key) returns ai:ChatInteractiveMessage[]|Error {
-        lock {
-            CachedMessages? cacheEntry = self.getCacheEntry(key);
-            if cacheEntry is CachedMessages {
-                return cacheEntry.interactiveMessages.clone();
-            }
-        }
-
         do {
-            final var allMessages = check self.cacheFromDynamoDb(key);
+            final var allMessages = check self.getAllFromDynamoDb(key);
             if allMessages is readonly & ai:ChatInteractiveMessage[] {
                 return allMessages;
             }
@@ -223,19 +196,8 @@ public isolated class ShortTermMemoryStore {
     # + return - A copy of the messages, or an `Error` error if the operation fails
     public isolated function getAll(string key)
             returns [ai:ChatSystemMessage, ai:ChatInteractiveMessage...]|ai:ChatInteractiveMessage[]|Error {
-        lock {
-            CachedMessages? cacheEntry = self.getCacheEntry(key);
-            if cacheEntry is CachedMessages {
-                final readonly & ai:ChatSystemMessage? systemMessage = cacheEntry.systemMessage;
-                if systemMessage is ai:ChatSystemMessage {
-                    return [systemMessage, ...cacheEntry.interactiveMessages].clone();
-                }
-                return cacheEntry.interactiveMessages.clone();
-            }
-        }
-
         do {
-            final var allMessages = check self.cacheFromDynamoDb(key);
+            final var allMessages = check self.getAllFromDynamoDb(key);
             return allMessages;
         } on fail Error err {
             return error("Failed to retrieve chat messages: " + err.message(), err);
@@ -255,23 +217,9 @@ public isolated class ShortTermMemoryStore {
         }
         ChatMessageDatabaseMessage dbMessage = transformToDatabaseMessage(message);
         if dbMessage is ChatSystemMessageDatabaseMessage {
-            check self.putSystemItem(key, dbMessage.toJsonString());
-        } else {
-            check self.appendInteractiveItems(key, [dbMessage.toJsonString()]);
+            return self.putSystemItem(key, dbMessage.toJsonString());
         }
-
-        final readonly & ai:ChatMessage immutableMessage = mapToImmutableMessage(message);
-        lock {
-            CachedMessages? cacheEntry = self.getCacheEntry(key);
-            if cacheEntry is () {
-                return;
-            }
-            if immutableMessage is ai:ChatSystemMessage {
-                cacheEntry.systemMessage = immutableMessage;
-            } else {
-                cacheEntry.interactiveMessages.push(immutableMessage);
-            }
-        }
+        return self.appendInteractiveItems(key, [dbMessage.toJsonString()]);
     }
 
     private isolated function putAll(string key, ai:ChatMessage[] messages) returns Error? {
@@ -280,7 +228,7 @@ public isolated class ShortTermMemoryStore {
         }
 
         final var [newSystemMessages, newInteractiveMessages] = partitionMessagesByType(messages);
-        final readonly & ai:ChatSystemMessage? finalChatSystemMessage = getLatestSystemMessage(newSystemMessages);
+        final ai:ChatSystemMessage? finalChatSystemMessage = getLatestSystemMessage(newSystemMessages);
 
         // The system PutItem and the interactive BatchWriteItem are separate calls and not
         // atomic. DynamoDB does not support a multi-item transaction through the operations
@@ -297,26 +245,6 @@ public isolated class ShortTermMemoryStore {
                 select dbMsg.toJsonString();
             check self.appendInteractiveItems(key, jsonValues);
         }
-
-        final ai:ChatInteractiveMessage[] & readonly immutableInteractiveMessages = from ai:ChatInteractiveMessage message
-            in newInteractiveMessages
-            select <readonly & ai:ChatInteractiveMessage>mapToImmutableMessage(message);
-        self.updateCache(key, finalChatSystemMessage, immutableInteractiveMessages);
-    }
-
-    private isolated function updateCache(string key, readonly & ai:ChatSystemMessage? systemMessage,
-            readonly & ai:ChatInteractiveMessage[] interactiveMessages) {
-        lock {
-            CachedMessages? cacheEntry = self.getCacheEntry(key);
-            if cacheEntry is () {
-                return;
-            }
-            if systemMessage is ai:ChatSystemMessage {
-                cacheEntry.systemMessage = systemMessage;
-            }
-            cacheEntry.interactiveMessages.push(...interactiveMessages);
-        }
-        return;
     }
 
     # Removes the system chat message, if specified, for a given key.
@@ -330,15 +258,6 @@ public isolated class ShortTermMemoryStore {
             Key: itemKey(key, SYSTEM_MESSAGE_ID)
         };
         dynamodb:ItemDescription|error deleteResult = self.dynamodbClient->deleteItem(deleteInput);
-        // Drop only the system-message slot from the cache (on both success and
-        // failure paths) so a transient delete error does not evict the cached
-        // interactive messages along with it.
-        lock {
-            CachedMessages? cacheEntry = self.getCacheEntry(key);
-            if cacheEntry is CachedMessages && cacheEntry.hasKey("systemMessage") {
-                cacheEntry.systemMessage = ();
-            }
-        }
         if deleteResult is error {
             return error("Failed to delete existing system message: " + deleteResult.message(), deleteResult);
         }
@@ -369,25 +288,7 @@ public isolated class ShortTermMemoryStore {
                 }
             }
         } on fail Error err {
-            // Leave the cache untouched on error so a transient delete failure does
-            // not evict the cached system message. The cache may be stale until the
-            // caller retries the delete (or the cache TTL expires), but the working
-            // set is preserved.
             return error("Failed to delete chat messages: " + err.message(), err);
-        }
-
-        lock {
-            CachedMessages? cacheEntry = self.getCacheEntry(key);
-            if cacheEntry is CachedMessages {
-                ai:ChatInteractiveMessage[] interactiveMessages = cacheEntry.interactiveMessages;
-                if count is () || count >= interactiveMessages.length() {
-                    interactiveMessages.removeAll();
-                } else {
-                    foreach int i in 0 ..< count {
-                        _ = interactiveMessages.shift();
-                    }
-                }
-            }
         }
     }
 
@@ -400,10 +301,8 @@ public isolated class ShortTermMemoryStore {
             string[] sortIds = check self.querySortIds(key, false);
             check self.deleteItems(key, sortIds);
         } on fail Error err {
-            self.removeCacheEntry(key);
             return error("Failed to delete chat messages: " + err.message(), err);
         }
-        self.removeCacheEntry(key);
     }
 
     # Checks if the memory store is full for a given key.
@@ -666,14 +565,14 @@ public isolated class ShortTermMemoryStore {
         }
     }
 
-    // Loads all messages for a key from DynamoDB and populates the cache on a miss.
+    // Loads all messages for a key from DynamoDB.
     //
     // A single `Query` on the partition key returns the system item, the counter item,
     // and every interactive item in one round trip. With `ScanIndexForward: true` the
     // stored sort keys ("counter" < "msg#…" < "system" lexicographically) come back in
     // an order that lets us classify each row by its sort-key prefix and skip the
     // counter row, while preserving chronological order of the interactive items.
-    private isolated function cacheFromDynamoDb(string key)
+    private isolated function getAllFromDynamoDb(string key)
             returns readonly & ([ai:ChatSystemMessage, ai:ChatInteractiveMessage...]|ai:ChatInteractiveMessage[])|Error {
         do {
             dynamodb:QueryInput queryInput = {
@@ -723,18 +622,8 @@ public isolated class ShortTermMemoryStore {
                 }
             }
 
-            final ai:ChatInteractiveMessage[] & readonly immutableInteractiveMessages =
-                interactiveMessages.cloneReadOnly();
-            lock {
-                cache:Cache? cache = self.cache;
-                if cache !is () && !cache.hasKey(key) {
-                    check cache.put(
-                        key, <CachedMessages>{systemMessage, interactiveMessages: [...immutableInteractiveMessages]});
-                }
-            }
-
             if systemMessage is () {
-                return immutableInteractiveMessages;
+                return interactiveMessages.cloneReadOnly();
             }
             return [systemMessage, ...interactiveMessages];
         } on fail error err {
@@ -788,36 +677,6 @@ public isolated class ShortTermMemoryStore {
             attempts += 1;
         }
     }
-
-    private isolated function removeCacheEntry(string key) {
-        lock {
-            cache:Cache? cache = self.cache;
-            if cache !is () && cache.hasKey(key) {
-                cache:Error? err = cache.invalidate(key);
-                if err is cache:Error {
-                    // Ignore, as this is for non-existent key
-                }
-            }
-        }
-    }
-
-    private isolated function getCacheEntry(string key) returns CachedMessages? {
-        lock {
-            cache:Cache? cache = self.cache;
-            if cache is () || !cache.hasKey(key) {
-                return ();
-            }
-
-            any|cache:Error cacheEntry = cache.get(key);
-            if cacheEntry is cache:Error {
-                return ();
-            }
-
-            // Since we have sole control over what is stored in the cache, this use of
-            // `checkpanic` is safe.
-            return checkpanic cacheEntry.ensureType();
-        }
-    }
 }
 
 isolated function partitionMessagesByType(ai:ChatMessage[] messages)
@@ -834,13 +693,11 @@ isolated function partitionMessagesByType(ai:ChatMessage[] messages)
     return [systemMsgs, interactiveMsgs];
 }
 
-isolated function getLatestSystemMessage(ai:ChatSystemMessage[] systemMessages)
-    returns readonly & ai:ChatSystemMessage? {
+isolated function getLatestSystemMessage(ai:ChatSystemMessage[] systemMessages) returns ai:ChatSystemMessage? {
     if systemMessages.length() == 0 {
         return;
     }
-    ai:ChatSystemMessage lastSystemMessage = systemMessages[systemMessages.length() - 1];
-    return <readonly & ai:ChatSystemMessage>mapToImmutableMessage(lastSystemMessage);
+    return systemMessages[systemMessages.length() - 1];
 }
 
 // Builds the composite primary key (partition key + sort key) of an item.
