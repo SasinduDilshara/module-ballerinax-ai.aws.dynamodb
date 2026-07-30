@@ -120,13 +120,13 @@ public isolated class ShortTermMemoryStore {
 
     # Initializes the DynamoDB-backed short-term memory store.
     #
-    # + dynamodbClient - The DynamoDB client or connection configuration to connect to DynamoDB
+    # + dbConnection - The DynamoDB client or connection configuration to connect to DynamoDB
     # + maxMessagesPerKey - The maximum number of interactive messages to store per key
     # + tableConfig - Configuration for the DynamoDB table that backs the store, including the table
     # name, whether to auto-create the table, billing mode, provisioned throughput, read consistency,
     # tags, and server-side encryption
     # + returns - An error if the initialization fails
-    public isolated function init(dynamodb:Client|dynamodb:ConnectionConfig dynamodbClient,
+    public isolated function init(@display {label: "Database Connection"} dynamodb:ConnectionConfig|dynamodb:Client dbConnection,
             int maxMessagesPerKey = 20,
             TableConfig tableConfig = {}) returns Error? {
         if !isValidTableName(tableConfig.tableName) {
@@ -146,10 +146,10 @@ public isolated class ShortTermMemoryStore {
                 + "when billingMode is dynamodb:PROVISIONED.");
         }
         self.tableName = tableConfig.tableName;
-        if dynamodbClient is dynamodb:Client {
-            self.dynamodbClient = dynamodbClient;
+        if dbConnection is dynamodb:Client {
+            self.dynamodbClient = dbConnection;
         } else {
-            dynamodb:Client|error initializedClient = new (dynamodbClient);
+            dynamodb:Client|error initializedClient = new (dbConnection);
             if initializedClient is error {
                 return error("Failed to create DynamoDB client: " + initializedClient.message(), initializedClient);
             }
