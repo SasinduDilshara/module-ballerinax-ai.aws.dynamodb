@@ -8,7 +8,6 @@ This module provides a DynamoDB-backed short-term memory store to use with AI me
 - One item per message using a composite primary key (partition key + sort key), so each session's history scales independently
 - The system message is stored as a singleton item and overwritten in place; interactive messages are appended in insertion order via a per-key sequence counter
 - Configurable maximum messages per key with automatic enforcement
-- Built-in in-memory caching for improved read performance
 - Automatic table creation on initialization, with a configurable billing mode
 - Support for both connection configuration and an existing `dynamodb:Client`
 
