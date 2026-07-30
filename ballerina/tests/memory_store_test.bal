@@ -18,8 +18,14 @@
 //
 // The tests run entirely against an in-memory `FakeDynamoDbClient`
 // (`tests/fake_dynamodb_client.bal`) that is installed via
-// `test:mock(dynamodb:Client, fake)`. No AWS credentials or DynamoDB Local
-// container are required.
+// `test:mock(dynamodb:Client, fake)`, so no AWS credentials and no running
+// DynamoDB instance are required.
+//
+// Mocking is the only option here, not merely the convenient one: the
+// `ballerinax/aws.dynamodb` client derives its endpoint solely from the AWS
+// region (`https://dynamodb.<region>.amazonaws.com`) and its `ConnectionConfig`
+// exposes no endpoint override, so the tests cannot be pointed at DynamoDB
+// Local or any other local emulator.
 
 import ballerina/ai;
 import ballerina/test;

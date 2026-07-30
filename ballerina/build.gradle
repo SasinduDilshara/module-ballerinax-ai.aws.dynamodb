@@ -73,70 +73,6 @@ task commitTomlFiles {
     }
 }
 
-// NOTE: The `ballerinax/aws.dynamodb` client builds its endpoint from the AWS region only and
-// has no endpoint-override, so it cannot target a local DynamoDB container. The compose file
-// below is provided for reference; the integration tests require real AWS credentials supplied
-// via `ballerina/tests/Config.toml` (accessKeyId, secretAccessKey, region).
-tasks.register('startDynamoDBServer') {
-    doLast {
-        def stdOut = new ByteArrayOutputStream()
-        def cmd = Os.isFamily(Os.FAMILY_WINDOWS) ? ['cmd', '/c'] : ['sh', '-c']
-        exec {
-            commandLine cmd + ["docker compose -f tests/resources/compose.yaml ps --services --filter status=running"]
-            standardOutput = stdOut
-        }
-        if (stdOut.toString().trim().isEmpty()) {
-            println "Starting the DynamoDB Local container"
-            exec {
-                commandLine cmd + ["docker compose -f tests/resources/compose.yaml up -d"]
-            }
-        } else {
-            println "Expected DynamoDB Local container is already running, not starting new containers."
-        }
-
-        def healthCheckPassed = false
-        int retries = 18
-        for (int i = 0; i < retries; i++) {
-            def healthOut = new ByteArrayOutputStream()
-            exec {
-                commandLine cmd + ["docker compose -f tests/resources/compose.yaml ps --services --filter status=running"]
-                standardOutput = healthOut
-                ignoreExitValue = true
-            }
-            if (!healthOut.toString().trim().isEmpty()) {
-                healthCheckPassed = true
-                break
-            }
-            sleep(5 * 1000)
-        }
-        if (!healthCheckPassed) {
-            throw new GradleException("The DynamoDB Local container did not become healthy in time.")
-        }
-        println "The DynamoDB Local container is healthy."
-    }
-}
-
-tasks.register('stopDynamoDBServer') {
-    doLast {
-        def stdOut = new ByteArrayOutputStream()
-        def cmd = Os.isFamily(Os.FAMILY_WINDOWS) ? ['cmd', '/c'] : ['sh', '-c']
-        exec {
-            commandLine cmd + ["docker compose -f tests/resources/compose.yaml ps --services --filter status=running"]
-            standardOutput = stdOut
-        }
-        if (!stdOut.toString().trim().isEmpty()) {
-            println "Stopping the DynamoDB Local container"
-            exec {
-                commandLine cmd + ["docker compose -f tests/resources/compose.yaml rm -svf"]
-                standardOutput = stdOut
-            }
-            println stdOut.toString()
-        } else {
-            println "The DynamoDB Local server is not started."
-        }
-    }
-}
-
 publishing {
     publications {
         maven(MavenPublication) {
@@ -162,7 +98,5 @@ clean {
 build.dependsOn "generatePomFileForMavenPublication"
 publishToMavenLocal.dependsOn build
 publish.dependsOn build
-test.dependsOn "startDynamoDBServer"
-test.finalizedBy "stopDynamoDBServer"
 build.dependsOn "updateTomlFiles"
 build.finalizedBy "commitTomlFiles"

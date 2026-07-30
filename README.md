@@ -88,11 +88,7 @@ import ballerinax/aws.dynamodb;
 
 2. Download and install [Ballerina Swan Lake](https://ballerina.io/).
 
-3. Download and install [Docker](https://www.docker.com/get-started).
-
-   > **Note**: Ensure that the Docker daemon is running before executing any tests.
-
-4. Export a GitHub personal access token with `read:packages` permission as follows:
+3. Export a GitHub personal access token with `read:packages` permission as follows:
 
     ```bash
     export packageUser=<Username>
