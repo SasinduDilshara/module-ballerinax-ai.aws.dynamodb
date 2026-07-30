@@ -50,19 +50,22 @@ isolated function transformToDatabaseMessage(ai:ChatMessage message) returns Cha
         insertions: content.insertions
     };
 
+    // `name` is an optional field on both message types, so it is read with the optional field
+    // access operator and only set on the mapped record when present. Assigning it
+    // unconditionally would panic when absent and would persist `"name": null`.
+    string? name = message?.name;
+
     if message is ai:ChatUserMessage {
-        return {
-            role: ai:USER,
-            content: transformedContent,
-            name: message.name
-        };
+        if name is string {
+            return {role: ai:USER, content: transformedContent, name};
+        }
+        return {role: ai:USER, content: transformedContent};
     }
 
-    return {
-        role: ai:SYSTEM,
-        content: transformedContent,
-        name: message.name
-    };
+    if name is string {
+        return {role: ai:SYSTEM, content: transformedContent, name};
+    }
+    return {role: ai:SYSTEM, content: transformedContent};
 }
 
 isolated function transformFromSystemMessageDatabaseMessage(ChatSystemMessageDatabaseMessage dbMessage)
@@ -71,11 +74,11 @@ isolated function transformFromSystemMessageDatabaseMessage(ChatSystemMessageDat
     string|(ai:Prompt & readonly) transformedContent = content is string ?
             content : createAIPrompt(content.strings.cloneReadOnly(), content.insertions.cloneReadOnly());
 
-    return {
-        role: ai:SYSTEM,
-        content: transformedContent,
-        name: dbMessage.name
-    };
+    string? name = dbMessage?.name;
+    if name is string {
+        return {role: ai:SYSTEM, content: transformedContent, name};
+    }
+    return {role: ai:SYSTEM, content: transformedContent};
 }
 
 isolated function transformFromInteractiveMessageDatabaseMessage(ChatInteractiveMessageDatabaseMessage dbMessage)
@@ -88,11 +91,11 @@ isolated function transformFromInteractiveMessageDatabaseMessage(ChatInteractive
     string|(ai:Prompt & readonly) transformedContent = content is string ?
             content : createAIPrompt(content.strings.cloneReadOnly(), content.insertions.cloneReadOnly());
 
-    return {
-        role: ai:USER,
-        content: transformedContent,
-        name: dbMessage.name
-    };
+    string? name = dbMessage?.name;
+    if name is string {
+        return {role: ai:USER, content: transformedContent, name};
+    }
+    return {role: ai:USER, content: transformedContent};
 }
 
 isolated function createAIPrompt(string[] & readonly strings, anydata[] & readonly insertions)

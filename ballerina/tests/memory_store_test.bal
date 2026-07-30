@@ -825,9 +825,9 @@ function testRemoveInteractivePartialAcrossChunkBoundary() returns error? {
 // -----------------------------------------------------------------------------
 // Control-plane / retry branches.
 //
-// These paths cannot be reached against DynamoDB Local (which creates tables
-// instantly and never throttles a BatchWriteItem), so they are exercised here
-// by arming the fault-injection knobs on `FakeDynamoDbClient`.
+// These paths depend on timing and throttling that a real table cannot be made
+// to reproduce on demand, so they are exercised here by arming the
+// fault-injection knobs on `FakeDynamoDbClient`.
 // -----------------------------------------------------------------------------
 
 @test:Config {}
@@ -1028,6 +1028,24 @@ function testInitFailsWhenActivationPollErrors() returns error? {
         test:assertTrue(result.message().includes("Failed to check the status"),
             string `Unexpected error message: ${result.message()}`);
     }
+}
+
+@test:Config {}
+function testInitToleratesTransientActivationPollErrors() returns error? {
+    var [fake, mocked] = newFakePair();
+    _ = check new ShortTermMemoryStore(mocked);
+
+    // The DynamoDB control plane is eventually consistent and throttles aggressively, so a
+    // DescribeTable issued while polling can fail transiently even though the table is fine.
+    // Let the existence check through, then fail the first poll with a retryable error: the
+    // store must keep polling within its retry budget instead of failing init.
+    fake.setDescribeFailuresTransient(true);
+    fake.setOpFailure(OP_DESCRIBE_TABLE, count = 1, skip = 1);
+
+    ShortTermMemoryStore store = check new (mocked);
+
+    check store.put(K1, USER_INTRO);
+    check assertInteractiveMessages(store, K1, [USER_INTRO]);
 }
 
 // -----------------------------------------------------------------------------

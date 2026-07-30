@@ -75,6 +75,10 @@ isolated class FakeStorage {
     // against a table that is already there, which is what a race between two
     // concurrent initializers looks like from one initializer's point of view.
     private int phantomAbsentDescribesRemaining = 0;
+    // When true, an armed `describeTable` failure is reported as a throttling error
+    // (which the store must re-poll) instead of the default `AccessDenied` flavour
+    // (which it must treat as fatal).
+    private boolean describeFailuresAreTransient = false;
     // The shape `updateItem` uses for its response. See the
     // `COUNTER_RESPONSE_*` constants.
     private string counterResponseMode = COUNTER_RESPONSE_NORMAL;
@@ -111,6 +115,20 @@ isolated class FakeStorage {
             }
             self.opFailures[operation] = remaining - 1;
             return true;
+        }
+    }
+
+    // Selects the flavour of the injected `describeTable` failures: a retryable
+    // throttling error when `transient` is true, `AccessDenied` otherwise.
+    isolated function setDescribeFailuresTransient(boolean 'transient) {
+        lock {
+            self.describeFailuresAreTransient = 'transient;
+        }
+    }
+
+    isolated function describeFailuresTransient() returns boolean {
+        lock {
+            return self.describeFailuresAreTransient;
         }
     }
 
@@ -364,7 +382,8 @@ isolated function getActiveStorage() returns FakeStorage {
 //   * `updateItem` understands the `ADD #seq :delta` expression and returns
 //     the new counter value under `Attributes`.
 //   * `writeBatchItems` processes `PutRequest` and `DeleteRequest` entries one
-//     at a time and never reports unprocessed items.
+//     at a time, and reports every entry back as `UnprocessedItems` while a test
+//     has armed `setUnprocessedRounds` (so the store's retry/backoff loop runs).
 //
 // The class itself carries no fields — all state lives in `activeStorage`.
 isolated client class FakeDynamoDbClient {
@@ -375,8 +394,12 @@ isolated client class FakeDynamoDbClient {
     remote isolated function describeTable(string tableName) returns dynamodb:TableDescription|error {
         FakeStorage storage = getActiveStorage();
         if storage.consumeOpFailure(OP_DESCRIBE_TABLE) {
-            // Deliberately *not* a ResourceNotFoundException: the store must treat
-            // any other DescribeTable failure as fatal instead of trying to create.
+            if storage.describeFailuresTransient() {
+                // A retryable control-plane failure: `waitForTableActive` must keep polling.
+                return error(string `ThrottlingException: rate exceeded for DescribeTable '${tableName}'`);
+            }
+            // Deliberately neither a ResourceNotFoundException nor a retryable error: the store
+            // must treat this failure as fatal instead of trying to create or to keep polling.
             return error(string `AccessDeniedException: not authorized to DescribeTable '${tableName}'`);
         }
         if !storage.tableExists(tableName) || storage.consumePhantomAbsentDescribe() {

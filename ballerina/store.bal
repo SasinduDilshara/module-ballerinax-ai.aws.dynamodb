@@ -93,9 +93,23 @@ const decimal BATCH_WRITE_MAX_DELAY = 20.0;
 // detection latency low when activation is fast.
 const int MAX_TABLE_ACTIVATION_RETRIES = 300;
 const decimal TABLE_ACTIVATION_RETRY_INTERVAL = 2;
+// AWS error keywords that make a `DescribeTable` failure worth re-polling while waiting for a
+// table to become active: the control plane is eventually consistent right after `CreateTable`
+// (so the table can briefly be reported absent), control-plane calls are throttled
+// aggressively, and server-side faults are by definition retryable. Anything else — a
+// permission or validation failure, say — leaves the status unknown for good and aborts.
+final readonly & string[] RETRYABLE_DESCRIBE_TABLE_ERROR_KEYWORDS = [
+    "ResourceNotFound",
+    "Throttling",
+    "ProvisionedThroughputExceeded",
+    "RequestLimitExceeded",
+    "InternalServerError",
+    "InternalFailure",
+    "ServiceUnavailable"
+];
 
 # Represents a DynamoDB-backed short-term memory store for messages.
-@display {label: "DynamoDB Short Term Memory Store"}
+@display {label: "Amazon DynamoDB Short Term Memory Store"}
 public isolated class ShortTermMemoryStore {
     *ai:ShortTermMemoryStore;
 
@@ -178,16 +192,13 @@ public isolated class ShortTermMemoryStore {
     # + key - The key associated with the memory
     # + return - A copy of the messages, or an `Error` error if the operation fails
     public isolated function getChatInteractiveMessages(string key) returns ai:ChatInteractiveMessage[]|Error {
-        do {
-            final var allMessages = check self.getAllFromDynamoDb(key);
-            if allMessages is readonly & ai:ChatInteractiveMessage[] {
-                return allMessages;
-            }
-            var [_, ...interactiveMessages] = allMessages;
-            return interactiveMessages;
-        } on fail Error err {
-            return error("Failed to retrieve chat messages: " + err.message(), err);
+        // `getAllFromDynamoDb` already wraps its failures, so they are surfaced as-is here.
+        final var allMessages = check self.getAllFromDynamoDb(key);
+        if allMessages is readonly & ai:ChatInteractiveMessage[] {
+            return allMessages;
         }
+        var [_, ...interactiveMessages] = allMessages;
+        return interactiveMessages;
     }
 
     # Retrieves all stored chat messages for a given key.
@@ -196,12 +207,8 @@ public isolated class ShortTermMemoryStore {
     # + return - A copy of the messages, or an `Error` error if the operation fails
     public isolated function getAll(string key)
             returns [ai:ChatSystemMessage, ai:ChatInteractiveMessage...]|ai:ChatInteractiveMessage[]|Error {
-        do {
-            final var allMessages = check self.getAllFromDynamoDb(key);
-            return allMessages;
-        } on fail Error err {
-            return error("Failed to retrieve chat messages: " + err.message(), err);
-        }
+        // `getAllFromDynamoDb` already wraps its failures, so they are surfaced as-is here.
+        return self.getAllFromDynamoDb(key);
     }
 
     # Adds one or more chat messages to the memory store for a given key.
@@ -370,18 +377,29 @@ public isolated class ShortTermMemoryStore {
         return self.waitForTableActive();
     }
 
-    // Polls the table until its status is `ACTIVE`.
+    // Polls the table until its status is `ACTIVE`. The DynamoDB control plane is eventually
+    // consistent, so right after `CreateTable` a `DescribeTable` can transiently report the
+    // table as absent or throttle the caller even though the table is on its way to `ACTIVE`.
+    // Such failures are re-polled within the same retry budget and only surface once the
+    // budget is exhausted; any other failure (e.g. `AccessDenied`) aborts immediately.
     private isolated function waitForTableActive() returns Error? {
+        error? lastTransientError = ();
         foreach int _ in 0 ..< MAX_TABLE_ACTIVATION_RETRIES {
             dynamodb:TableDescription|error description = self.dynamodbClient->describeTable(self.tableName);
             if description is error {
-                return error(string `Failed to check the status of the '${self.tableName}' table: `
-                    + description.message(), description);
-            }
-            if description?.TableStatus == dynamodb:ACTIVE {
+                if !isRetryableDescribeTableError(description) {
+                    return error(string `Failed to check the status of the '${self.tableName}' table: `
+                        + description.message(), description);
+                }
+                lastTransientError = description;
+            } else if description?.TableStatus == dynamodb:ACTIVE {
                 return;
             }
             runtime:sleep(TABLE_ACTIVATION_RETRY_INTERVAL);
+        }
+        if lastTransientError is error {
+            return error(string `The '${self.tableName}' table did not become active within the expected time: `
+                + lastTransientError.message(), lastTransientError);
         }
         return error(string `The '${self.tableName}' table did not become active within the expected time.`);
     }
@@ -738,6 +756,17 @@ isolated function isValidTableName(string tableName) returns boolean =>
 // Returns whether an error (message or detail) mentions the given AWS error keyword.
 isolated function errorMentions(error err, string keyword) returns boolean =>
     err.toString().toLowerAscii().includes(keyword.toLowerAscii());
+
+// Returns whether a `DescribeTable` failure is transient, i.e. worth polling again rather than
+// failing initialization outright. See `RETRYABLE_DESCRIBE_TABLE_ERROR_KEYWORDS`.
+isolated function isRetryableDescribeTableError(error err) returns boolean {
+    foreach string keyword in RETRYABLE_DESCRIBE_TABLE_ERROR_KEYWORDS {
+        if errorMentions(err, keyword) {
+            return true;
+        }
+    }
+    return false;
+}
 
 // Computes a full-jitter exponential backoff delay in seconds for the given retry attempt.
 // `sleep = random(0, min(MAX_DELAY, BASE_DELAY * 2^attempt))`. See the AWS Architecture Blog
