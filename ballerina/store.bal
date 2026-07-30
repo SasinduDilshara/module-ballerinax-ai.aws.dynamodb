@@ -48,14 +48,23 @@ public type Error distinct ai:MemoryError;
 # + sseSpecification - Optional server-side encryption settings to apply when the connector creates
 # the table. If omitted, the table uses the default AWS-owned encryption key. Ignored if the table
 # already exists
+@display {label: "Table Configuration"}
 public type TableConfig record {|
+    @display {label: "Table Name"}
     string tableName = "chat_memory";
+    @display {label: "Create Table If Not Exists"}
     boolean createTableIfNotExists = true;
+    @display {label: "Billing Mode"}
     dynamodb:BillingMode billingMode = dynamodb:PAY_PER_REQUEST;
+    @display {label: "Read Capacity Units"}
     int readCapacityUnits = 5;
+    @display {label: "Write Capacity Units"}
     int writeCapacityUnits = 5;
+    @display {label: "Consistent Reads"}
     boolean consistentReads = false;
+    @display {label: "Tags"}
     dynamodb:Tag[]? tags = ();
+    @display {label: "Server-Side Encryption"}
     dynamodb:SSESpecification? sseSpecification = ();
 |};
 
@@ -127,8 +136,8 @@ public isolated class ShortTermMemoryStore {
     # tags, and server-side encryption
     # + returns - An error if the initialization fails
     public isolated function init(@display {label: "Database Connection"} dynamodb:ConnectionConfig|dynamodb:Client dbConnection,
-            int maxMessagesPerKey = 20,
-            TableConfig tableConfig = {}) returns Error? {
+            @display {label: "Max Messages Per Key"} int maxMessagesPerKey = 20,
+            @display {label: "Table Configuration"} TableConfig tableConfig = {}) returns Error? {
         if !isValidTableName(tableConfig.tableName) {
             return error(string `Invalid table name: '${tableConfig.tableName}'.`
                 + " Table name must be 3-255 characters long and can only contain "
