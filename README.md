@@ -75,12 +75,6 @@ import ballerinax/aws.dynamodb;
     }, 10, tableConfig = {tableName: "my_app_memory"});
     ```
 
-## Examples
-
-The `ai.aws.dynamodb` connector provides a practical example illustrating usage in a real-world scenario.
-
-- [Chat memory with an agent](https://github.com/ballerina-platform/module-ballerinax-ai.aws.dynamodb/tree/main/examples/chat-memory-with-agent) - Wire the DynamoDB-backed store into an `ai:Agent` and run a multi-turn conversation that persists across turns.
-
 ## Build from the source
 
 ### Setting up the prerequisites
